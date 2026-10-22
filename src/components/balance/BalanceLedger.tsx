@@ -33,8 +33,9 @@ import {
   OPENING_CUTOFF,
   PHP,
   formatLedgerDate,
-  easternToday,
+  manilaToday,
   monthLabel,
+  postMissingSalaryAccruals,
   salaryAccrualsThrough,
 } from "./balance-utils";
 import {
@@ -90,12 +91,25 @@ interface SourceFile {
 
 const BUCKET = "balance-proofs";
 
+/** Colour-coded chip per money type so the ledger can be scanned at a glance. */
+const CATEGORY_CHIP: Record<string, string> = {
+  "Opening Balance": "bg-muted text-muted-foreground border-border",
+  Salary: "bg-primary/10 text-primary border-primary/20",
+  "Overtime Pay": "bg-success/10 text-success border-success/20",
+  "Payment to Gibbs": "bg-accent text-accent-foreground border-border",
+  "Gibbs Monthly Charge": "bg-destructive/10 text-destructive border-destructive/20",
+  "Gibbs Lent Jerica Money": "bg-secondary text-secondary-foreground border-border",
+  "Gibbs Paid Expense for Jerica": "bg-secondary text-secondary-foreground border-border",
+  Adjustment: "bg-muted text-muted-foreground border-border",
+  "Historical Detail": "bg-muted text-muted-foreground border-border",
+};
+
 const emptyForm = {
   direction: "plus" as "plus" | "minus",
   category: "Adjustment" as Category,
   amount: "",
   dateMode: "exact" as "exact" | "month" | "unknown",
-  occurred_on: easternToday(),
+  occurred_on: manilaToday(),
   description: "",
   excluded: true,
 };
@@ -115,8 +129,9 @@ export function BalanceLedger() {
   const [voidConfirm, setVoidConfirm] = useState<Txn | null>(null);
   const [form, setForm] = useState(emptyForm);
   const [proofFile, setProofFile] = useState<File | null>(null);
+  const [monthFilter, setMonthFilter] = useState<string>("all");
 
-  const today = easternToday();
+  const today = manilaToday();
   const currentPeriod = today.slice(0, 7);
 
   const load = useCallback(async () => {
@@ -127,16 +142,29 @@ export function BalanceLedger() {
       supabase.from("balance_source_files").select("*").eq("account_id", account.id).order("slot"),
       supabase.from("profiles").select("user_id,name"),
     ]);
-    setTxns(
-      ((t.data ?? []) as unknown as Txn[])
-        .map((r) => ({ ...r, amount: Number(r.amount) }))
-        .sort(
-          (a, b) =>
-            a.ordinal - b.ordinal ||
-            (a.occurred_on ?? "9999-12-31").localeCompare(b.occurred_on ?? "9999-12-31") ||
-            a.created_at.localeCompare(b.created_at)
-        )
+    // Order strictly by the date the money moved, oldest first, so the running
+    // balance reads like a bank statement. Rows with no recorded date inherit
+    // the date of the entry that came before them in the original seed order.
+    const seedOrdered = ((t.data ?? []) as unknown as Txn[])
+      .map((r) => ({ ...r, amount: Number(r.amount) }))
+      .sort(
+        (a, b) =>
+          a.ordinal - b.ordinal ||
+          (a.occurred_on ?? "9999-12-31").localeCompare(b.occurred_on ?? "9999-12-31") ||
+          a.created_at.localeCompare(b.created_at)
+      );
+    let lastKnownDate = "2026-06-30";
+    const withSortDate = seedOrdered.map((r) => {
+      if (r.occurred_on) lastKnownDate = r.occurred_on;
+      return { row: r, sortDate: r.occurred_on ?? lastKnownDate };
+    });
+    withSortDate.sort(
+      (a, b) =>
+        a.sortDate.localeCompare(b.sortDate) ||
+        a.row.ordinal - b.row.ordinal ||
+        a.row.created_at.localeCompare(b.row.created_at)
     );
+    setTxns(withSortDate.map((x) => x.row));
     setCharges(
       ((c.data ?? []) as unknown as Charge[])
         .map((r) => ({
@@ -159,16 +187,16 @@ export function BalanceLedger() {
   const ensureScheduled = useCallback(async () => {
     if (!account) return;
     const due = salaryAccrualsThrough(today, account.monthly_salary);
-    const { data: existing } = await supabase
+    const { data: existing, error: lookupError } = await supabase
       .from("balance_transactions")
       .select("schedule_key")
       .eq("account_id", account.id)
       .not("schedule_key", "is", null);
-    const have = new Set((existing ?? []).map((r) => r.schedule_key as string));
-    const missing = due.filter((d) => !have.has(d.schedule_key));
-    if (missing.length) {
-      await supabase.from("balance_transactions").insert(
-        missing.map((d) => ({
+    try {
+      if (lookupError) throw new Error(lookupError.message);
+      const have = new Set((existing ?? []).map((r) => r.schedule_key as string));
+      await postMissingSalaryAccruals(due, have, async (d) =>
+        await supabase.from("balance_transactions").insert({
           account_id: account.id,
           occurred_on: d.occurred_on,
           direction: "plus",
@@ -176,8 +204,14 @@ export function BalanceLedger() {
           amount: d.amount,
           description: d.description,
           schedule_key: d.schedule_key,
-        }))
+        })
       );
+    } catch (error) {
+      toast({
+        title: "Salary schedule could not be synced",
+        description: error instanceof Error ? error.message : "Please try again.",
+        variant: "destructive",
+      });
     }
     if (currentPeriod >= "2026-10") {
       await supabase
@@ -192,7 +226,7 @@ export function BalanceLedger() {
           { onConflict: "account_id,period", ignoreDuplicates: true }
         );
     }
-  }, [account, currentPeriod, today]);
+  }, [account, currentPeriod, today, toast]);
 
   useEffect(() => {
     if (!account) {
@@ -216,6 +250,54 @@ export function BalanceLedger() {
   }, [txns]);
 
   const balance = rows.length ? rows[rows.length - 1].running : 0;
+
+  /** Every month that has at least one entry, newest first. */
+  const monthOptions = useMemo(() => {
+    const set = new Set<string>();
+    txns.forEach((t) => {
+      if (t.occurred_on) set.add(t.occurred_on.slice(0, 7));
+    });
+    return Array.from(set).sort((a, b) => b.localeCompare(a));
+  }, [txns]);
+
+  /** Rows shown in the table: newest date first, optionally limited to one month. */
+  const visibleRows = useMemo(() => {
+    const filtered =
+      monthFilter === "all"
+        ? rows
+        : rows.filter((r) => (r.t.occurred_on ?? "").slice(0, 7) === monthFilter);
+    return [...filtered].reverse();
+  }, [rows, monthFilter]);
+
+  /** Plain-English totals for the month currently in focus. */
+  const monthSummary = useMemo(() => {
+    const period = monthFilter === "all" ? currentPeriod : monthFilter;
+    const inMonth = rows.filter(
+      (r) => r.affects && (r.t.occurred_on ?? "").slice(0, 7) === period
+    );
+    const sumOf = (match: (c: string) => boolean) =>
+      inMonth
+        .filter((r) => match(r.t.category))
+        .reduce((n, r) => n + (r.t.direction === "plus" ? r.t.amount : -r.t.amount), 0);
+
+    const salary = sumOf((c) => c === "Salary");
+    const overtime = sumOf((c) => c === "Overtime Pay");
+    const payments = sumOf((c) => c === "Payment to Gibbs");
+    const charges = sumOf((c) => c === "Gibbs Monthly Charge");
+    const other = sumOf(
+      (c) => !["Salary", "Overtime Pay", "Payment to Gibbs", "Gibbs Monthly Charge"].includes(c)
+    );
+    return {
+      period,
+      salary,
+      overtime,
+      payments,
+      charges,
+      other,
+      net: salary + overtime + payments + charges + other,
+      count: inMonth.length,
+    };
+  }, [rows, monthFilter, currentPeriod]);
 
   // Approved OT posts an "Overtime Pay" row server-side; refresh the ledger live.
   useRealtimeTables(["balance_transactions", "overtime_requests"], load);
@@ -482,15 +564,58 @@ export function BalanceLedger() {
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="rounded-lg border bg-primary/10 p-4">
-            <p className="text-sm text-muted-foreground">Running Balance Owed to Gibbs</p>
-            <p className="mt-1 text-3xl font-bold tabular-nums text-primary sm:text-4xl">
-              {PHP(balance)}
-            </p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Cumulative total of every balance-affecting entry below.
-            </p>
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
+            <div className="flex flex-col justify-center rounded-lg border bg-primary/10 p-4">
+              <p className="text-sm text-muted-foreground">Running Balance Owed to Gibbs</p>
+              <p className="mt-1 text-3xl font-bold tabular-nums text-primary sm:text-4xl">
+                {PHP(balance)}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Cumulative total of every balance-affecting entry below.
+              </p>
+            </div>
+
+            {/* What made up the month in focus */}
+            <div className="rounded-lg border p-4">
+              <p className="text-sm font-medium">
+                {monthLabel(monthSummary.period)} breakdown
+              </p>
+              <div className="mt-3 space-y-1.5 text-sm">
+                {[
+                  { label: "Salary", value: monthSummary.salary },
+                  { label: "Overtime", value: monthSummary.overtime },
+                  { label: "Rent & Netflix", value: monthSummary.charges },
+                  { label: "Payments received from Jerica", value: monthSummary.payments },
+                  ...(monthSummary.other !== 0
+                    ? [{ label: "Other entries", value: monthSummary.other }]
+                    : []),
+                ].map((line) => (
+                  <div key={line.label} className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">{line.label}</span>
+                    <span
+                      className={`tabular-nums font-medium ${
+                        line.value < 0 ? "text-destructive" : "text-success"
+                      }`}
+                    >
+                      {line.value < 0 ? "−" : "+"} {PHP(Math.abs(line.value))}
+                    </span>
+                  </div>
+                ))}
+                <Separator className="my-2" />
+                <div className="flex items-center justify-between gap-3 font-semibold">
+                  <span>Change this month</span>
+                  <span
+                    className={`tabular-nums ${
+                      monthSummary.net < 0 ? "text-destructive" : "text-success"
+                    }`}
+                  >
+                    {monthSummary.net < 0 ? "−" : "+"} {PHP(Math.abs(monthSummary.net))}
+                  </span>
+                </div>
+              </div>
+            </div>
           </div>
+
           <p className="text-xs text-muted-foreground">
             PLUS increases what Jerica owes Gibbs. MINUS reduces it. Voiding removes an entry from the
             running balance but never deletes it — use Undo / Restore to bring it back.
@@ -511,8 +636,8 @@ export function BalanceLedger() {
               <span className="font-semibold text-success">+ {PHP(account.monthly_salary)}</span>
             </div>
             <p className="text-xs text-muted-foreground">
-              Eastern Time (America/New_York). Salary accrues automatically on the 1st of each month;
-              payments never do. Next automatic salary cycle begins October 1, 2026.
+              One monthly salary of PHP{account.monthly_salary.toLocaleString("en-PH")} on the 1st, Eastern Time.
+              {" "}Approved overtime is separate. Actual payments reduce the balance and are recorded separately.
             </p>
           </CardContent>
         </Card>
@@ -581,29 +706,64 @@ export function BalanceLedger() {
       {/* History */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Transaction history</CardTitle>
-          <CardDescription>Running balance is recalculated from every balance-affecting row.</CardDescription>
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <CardTitle className="text-base">Transaction history</CardTitle>
+              <CardDescription>
+                Newest entries first. The Balance column is the running total as of that date.
+              </CardDescription>
+            </div>
+            <div className="w-48">
+              <Label className="text-xs text-muted-foreground">Show</Label>
+              <Select value={monthFilter} onValueChange={setMonthFilter}>
+                <SelectTrigger className="mt-1 h-9">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All months</SelectItem>
+                  {monthOptions.map((m) => (
+                    <SelectItem key={m} value={m}>
+                      {monthLabel(m)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
         </CardHeader>
         <CardContent className="overflow-x-auto">
-          <table className="w-full min-w-[900px] text-sm">
+          <table className="w-full min-w-[820px] text-sm">
             <thead className="text-xs uppercase text-muted-foreground">
               <tr className="border-b">
                 <th className="p-2 text-left">Date</th>
-                <th className="p-2 text-left">Description</th>
-                <th className="p-2 text-left">Category</th>
+                <th className="p-2 text-left">Entry</th>
                 <th className="p-2 text-right">Amount</th>
                 <th className="p-2 text-right">Balance</th>
                 <th className="p-2 text-left">Verification</th>
-                <th className="p-2 text-left">Audit</th>
                 <th className="p-2 text-right">Actions</th>
               </tr>
             </thead>
             <tbody>
-              {rows.map(({ t, affects, running }) => (
+              {visibleRows.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="p-6 text-center text-muted-foreground">
+                    No entries for this month.
+                  </td>
+                </tr>
+              )}
+              {visibleRows.map(({ t, affects, running }) => (
                 <tr key={t.id} className={`border-b align-top ${t.status === "void" ? "opacity-50" : ""}`}>
-                  <td className="p-2 whitespace-nowrap">{formatLedgerDate(t.occurred_on, t.date_precision)}</td>
+                  <td className="p-2 whitespace-nowrap font-medium">
+                    {formatLedgerDate(t.occurred_on, t.date_precision)}
+                  </td>
                   <td className="p-2">
-                    <div>{t.description ?? "—"}</div>
+                    <Badge
+                      variant="outline"
+                      className={`mb-1 font-normal ${CATEGORY_CHIP[t.category] ?? ""}`}
+                    >
+                      {t.category}
+                    </Badge>
+                    <div className="text-muted-foreground">{t.description ?? "—"}</div>
                     {!affects && t.status === "active" && (
                       <span className="text-xs text-muted-foreground">
                         Already included in opening balance
@@ -618,10 +778,13 @@ export function BalanceLedger() {
                         View {t.proof_name ?? "proof"}
                       </button>
                     )}
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      Added by {t.created_by ? displayName(t.created_by) : "system"} · last edited{" "}
+                      {new Date(t.updated_at).toLocaleDateString()}
+                    </div>
                   </td>
-                  <td className="p-2 whitespace-nowrap">{t.category}</td>
                   <td
-                    className={`p-2 text-right tabular-nums whitespace-nowrap ${t.direction === "plus" ? "text-success" : "text-destructive"}`}
+                    className={`p-2 text-right tabular-nums whitespace-nowrap font-medium ${t.direction === "plus" ? "text-success" : "text-destructive"}`}
                   >
                     {t.direction === "plus" ? "+" : "−"} {PHP(t.amount)}
                   </td>
@@ -642,10 +805,6 @@ export function BalanceLedger() {
                         Verify
                       </Button>
                     )}
-                  </td>
-                  <td className="p-2 text-xs text-muted-foreground whitespace-nowrap">
-                    <div>Added by {t.created_by ? displayName(t.created_by) : "system"}</div>
-                    <div>Edited {new Date(t.updated_at).toLocaleDateString()}</div>
                   </td>
                   <td className="p-2 text-right whitespace-nowrap">
                     <Button size="sm" variant="ghost" className="h-7" onClick={() => openEdit(t)}>
