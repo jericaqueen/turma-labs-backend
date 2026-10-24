@@ -46,6 +46,24 @@ Deno.serve(async (req: Request) => {
     }
 
     const body = await req.json().catch(() => ({}));
+    // One-time repair of a payout disclosure wrongly posted to a team channel.
+    if (body?.cleanup_wrong_general_post === true) {
+      const messageId = '1563365516704223254';
+      const candidates: [string, string | undefined][] = [
+        ['incentives', Deno.env.get('DISCORD_WEBHOOK_INCENTIVES')],
+        ['default', Deno.env.get('DISCORD_WEBHOOK_URL')],
+      ];
+      const attempts: { route: string; status: number }[] = [];
+      for (const [routeName, webhook] of candidates) {
+        if (!webhook) continue;
+        const base = webhook.split('?')[0].replace(/\\/$/, '');
+        const res = await fetch(base + '/messages/' + messageId, { method: 'DELETE' });
+        attempts.push({ route: routeName, status: res.status });
+        if (res.status === 204) return reply({ ok: true, deleted: true, message_id: messageId, route: routeName });
+      }
+      return reply({ ok: false, deleted: false, attempts }, 404);
+    }
+
     const incentiveId = typeof body?.incentive_id === 'string' ? body.incentive_id : '';
     if (!/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(incentiveId)) {
       return reply({ error: 'Valid incentive_id required' }, 400);
