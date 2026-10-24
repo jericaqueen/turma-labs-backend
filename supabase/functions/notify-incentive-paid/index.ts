@@ -56,7 +56,7 @@ Deno.serve(async (req: Request) => {
       const attempts: { route: string; status: number }[] = [];
       for (const [routeName, webhook] of candidates) {
         if (!webhook) continue;
-        const base = webhook.split('?')[0].replace(/\\/$/, '');
+        const base = webhook.split('?')[0];
         const res = await fetch(base + '/messages/' + messageId, { method: 'DELETE' });
         attempts.push({ route: routeName, status: res.status });
         if (res.status === 204) return reply({ ok: true, deleted: true, message_id: messageId, route: routeName });
